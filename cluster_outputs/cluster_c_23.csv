@@ -1,0 +1,4 @@
+workorder,date_time_opened,date_time_closed,registration,total_time,ata_code,problem,date,action,cluster,cluster_name
+1167965,2017-10-13 14:34:00,2017-10-13 11:12:00,N695ND,7300.6,7410.0,2 IGN LEADS @ MAG CAP SPRINGS BROKEN ON L/H MAG OF L/H ENGINE.,2017-10-13,"REPAIRED W/ NEW ELECTROBRAID PIN, INSULATOR & SPRING (2 EA).",c_23,engine repair reinstall clean remove replace engine
+1170745,2018-02-07 17:38:00,2018-02-07 13:02:00,N571ND,12725.4,7100.0,"DURING RUN UP, R/H MAG DROPPED 210 RPM, ENGINE RAN ROUGH THEN BACK FIRED. AFTER ATTEMPTING TO CLEAN ENGINE, MAG DROPPED 220 RPM.",2018-02-07,"RAN A/C, ALL MAG CHECKS GOOD. NO ROUGHNESS NOTED.",c_23,engine repair reinstall clean remove replace engine
+1179552,2018-12-17 09:52:00,2018-12-18 10:47:00,N718ND,3621.0,7100.0,ENGINE DIRTY.,2018-12-17,CLEANED ENGINE.,c_23,engine repair reinstall clean remove replace engine
