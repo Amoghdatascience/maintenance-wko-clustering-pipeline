@@ -1,7 +1,7 @@
 """
 Aviation Maintenance Workorder Clustering Pipeline
 
-This script converts raw aviation maintenance workorders into structured
+This module converts raw aviation maintenance workorders into structured
 cluster labels using a hybrid pipeline that combines:
 
 1. Rule-based classification (seed rules + strict token rules)
@@ -12,7 +12,6 @@ cluster labels using a hybrid pipeline that combines:
 Outputs
 -------
 - datasets/dataset.csv: final clustered workorder records
-- datasets/summary.csv: UNKNOWN before/after/recovered metrics
 
 Author: Amogh Naik
 """
@@ -21,27 +20,35 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import hstack
+from scipy.sparse import hstack, spmatrix
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.model_selection import train_test_split
 
+# ---------------------------------------------------------------------
 # Configuration
+# ---------------------------------------------------------------------
 
 BASE_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BASE_DIR / "datasets"
 
 INPUT_FILE = DATASET_DIR / "Valid_Problems_Workorder.xlsx"
 OUTPUT_DATASET = DATASET_DIR / "dataset.csv"
-#OUTPUT_SUMMARY = DATASET_DIR / "summary.csv"
 RANDOM_STATE = 42
 
-abbr_map = {
+# Abbreviation expansion is essential because aviation maintenance text
+# contains a large amount of shorthand, abbreviations, and compressed terms.
+# Expanding these terms improves:
+# - rule-based matching precision
+# - TF-IDF feature quality
+# - semantic similarity consistency
+abbr_map: Dict[str, str] = {
     r"\ba/c\b": "aircraft",
     r"\bacft\b": "aircraft",
     r"\bmx\b": "maintenance",
@@ -112,10 +119,14 @@ abbr_map = {
     r"\bfod\b": "foreign object debris",
     r"\brivnut\b": "rivet nut",
     r"\bnutplate\b": "nut plate",
+    r"\b\vfeb": "maximum flap extended speed",
     r"\bgpu\b": "ground power unit",
 }
 
-cluster_desc = {
+# Child-cluster descriptions are used for:
+# 1. human-readable cluster naming
+# 2. semantic similarity fallback when ML confidence is weak
+cluster_desc: Dict[str, str] = {
     "c_0": "inspection routine scheduled inspection",
     "c_1": "aircraft start issue hard start no start starter no crank",
     "c_2": "baffle bolt",
@@ -132,7 +143,7 @@ cluster_desc = {
     "c_13": "cylinder compression low compression",
     "c_14": "cylinder crack failure",
     "c_15": "exhaust valve stuck valve",
-    "c_16": "cylinder head temperature exhaust gas temperature",
+    "c_16": "cylinder head temperature",
     "c_17": "pushrod tube",
     "c_18": "drain line tube",
     "c_19": "carburetor carb",
@@ -142,7 +153,7 @@ cluster_desc = {
     "c_23": "engine repair reinstall clean remove replace engine",
     "c_24": "engine run rough rough running misfire",
     "c_25": "engine seal tube bolt loose",
-    "c_26": "propeller overspeed prop damage",
+    "c_26": "propeller overspeed",
     "c_27": "induction leak induction system",
     "c_28": "intake gasket",
     "c_29": "intake tube boot seal",
@@ -159,32 +170,52 @@ cluster_desc = {
     "c_40": "battery issue low voltage weak battery charging issue",
     "c_41": "external start issue external power ground power unit start",
     "c_42": "flight control aileron elevator rudder flap spoiler trim",
-    "c_43": "appearance cleaning paint wash dirty exterior clean fuselage surface finish cosmetic exterior surface",
+    "c_43": (
+        "appearance cleaning paint wash dirty exterior clean fuselage "
+        "surface finish cosmetic exterior surface"
+    ),
     "c_44": "landing gear tire",
+    "c_45": "exhaust gas temperature",
+    "c_46": "propeller damage",
 }
 
-cluster_name_map = cluster_desc.copy()
+cluster_name_map: Dict[str, str] = cluster_desc.copy()
 
-parent_desc = {
+# Parent descriptions support the hierarchical stage by first predicting
+# broader systems before predicting specific child clusters.
+parent_desc: Dict[str, str] = {
     "inspection": "inspection routine scheduled inspection check",
-    "start_system": "aircraft start starter hard start no start no crank external start ground power",
+    "start_system": (
+        "aircraft start starter hard start no start no crank "
+        "external start ground power"
+    ),
     "baffle": "baffle bolt bracket crack mount plug rivet screw seal spring tie rod",
     "cowling": "cowling cowl damage loose missing",
-    "cylinder_Exhaust": "cylinder compression crack exhaust valve temperature push rod pushrod tube",
-    "engine_general": "engine rough idle repair crankcase carburetor engine failure power loss",
+    "cylinder_Exhaust": (
+        "cylinder compression crack exhaust valve temperature " "push rod pushrod tube"
+    ),
+    "engine_general": (
+        "engine rough idle repair crankcase carburetor " "engine failure power loss"
+    ),
     "propeller": "propeller overspeed propeller damage",
     "induction_intake": "induction intake gasket boot seal leak",
     "ignition": "magneto ignition spark plug mag drop fouled plug",
     "fuel_control": "mixture mixture control fuel adjust",
-    "oil_system": "oil cooler dipstick filler tube oil leak oil pressure oil temperature return line",
+    "oil_system": (
+        "oil cooler dipstick filler tube oil leak oil pressure "
+        "oil temperature return line"
+    ),
     "pilot_reported": "pilot reported in flight pilot noticed",
     "valve_cover": "rocker cover valve cover sniffler valve",
     "electrical": "battery voltage charging alternator electrical",
-    "appearance_cleaning": "paint wash dirty exterior clean fuselage surface finish cosmetic exterior appearance cleaning",
+    "appearance_cleaning": (
+        "paint wash dirty exterior clean fuselage surface finish "
+        "cosmetic exterior appearance cleaning"
+    ),
     "landing_gear_tire": "landing gear tire",
 }
 
-cluster_to_parent = {
+cluster_to_parent: Dict[str, str] = {
     "c_0": "inspection",
     "c_1": "start_system",
     "c_41": "start_system",
@@ -230,21 +261,41 @@ cluster_to_parent = {
     "c_42": "flight_control",
     "c_43": "appearance_cleaning",
     "c_44": "landing_gear_tire",
+    "c_45": "cylinder_Exhaust",
+    "c_46": "propeller",
 }
 
 
 def build_parent_to_children_map(
     cluster_parent_map: dict[str, str],
 ) -> dict[str, list[str]]:
-    parent_to_children: dict[str, list[str]] = {}
+    """
+    Build a reverse mapping from parent cluster to child clusters.
+
+    Purpose in pipeline:
+    The hierarchical child-classification stage operates parent by parent.
+    This helper creates the structure required to retrieve all child clusters
+    that belong to a predicted parent system.
+
+    Parameters:
+    cluster_parent_map (dict[str, str]): Mapping from child cluster ID to parent cluster.
+
+    Returns:
+    dict[str, list[str]]: Mapping from parent cluster to the list of child clusters.
+    """
+    parent_to_children: Dict[str, List[str]] = {}
     for child, parent in cluster_parent_map.items():
         parent_to_children.setdefault(parent, []).append(child)
     return parent_to_children
 
 
-PARENT_TO_CHILDREN = build_parent_to_children_map(cluster_to_parent)
+PARENT_TO_CHILDREN: Dict[str, List[str]] = build_parent_to_children_map(
+    cluster_to_parent
+)
 
-seed_rules = {
+# Seed rules intentionally prioritize precision over recall.
+# They provide high-confidence weak labels that bootstrap the ML stages.
+seed_rules: Dict[str, List[str]] = {
     "c_41": [
         "external start",
         "external power",
@@ -265,7 +316,7 @@ seed_rules = {
     "c_13": ["compression", "low compression"],
     "c_14": ["cylinder crack", "cylinder failure", "cracked cylinder"],
     "c_15": ["exhaust valve", "stuck valve"],
-    "c_16": ["cylinder head temperature", "exhaust gas temperature", "egt", "cht"],
+    "c_16": ["cylinder head temperature", "cht"],
     "c_17": ["push rod", "pushrod", "push tube"],
     "c_18": ["drain line", "drain tube"],
     "c_19": ["carburetor", "carb"],
@@ -280,7 +331,7 @@ seed_rules = {
     ],
     "c_24": ["engine rough", "run rough", "rough running", "misfire", "stumble"],
     "c_25": ["engine seal", "engine tube", "engine bolt"],
-    "c_26": ["propeller overspeed", "overspeed", "prop damage"],
+    "c_26": ["propeller overspeed"],
     "c_27": ["induction", "induction leak", "induction system"],
     "c_28": ["intake gasket"],
     "c_29": ["intake tube", "intake boot", "intake seal"],
@@ -321,9 +372,13 @@ seed_rules = {
     ],
     "c_42": ["aileron", "elevator", "rudder", "flap", "spoiler", "trim", "strut"],
     "c_43": ["paint", "wash", "dirty exterior", "cosmetic"],
+    "c_45": ["exhaust gas temperature", "egt"],
+    "c_46": ["prop damage", "propeller damage", "damaged propeller"],
 }
 
-baffle_and_rules = {
+# Baffle records often contain overlapping terms. These stricter token rules
+# require all tokens to be present, which reduces ambiguous matches.
+baffle_and_rules: Dict[str, List[List[str]]] = {
     "c_2": [["baffle", "bolt"]],
     "c_3": [["baffle", "bracket"]],
     "c_5": [["baffle", "mount"]],
@@ -343,9 +398,30 @@ baffle_and_rules = {
 
 
 def normalize_series(series: pd.Series) -> pd.Series:
+    """
+    Normalize maintenance text for downstream rule-based and ML processing.
+
+    Purpose in pipeline:
+    This function standardizes problem and action text so that rule matching,
+    TF-IDF feature extraction, and semantic similarity all operate on the same
+    cleaned representation.
+
+    Key design decisions:
+    - Lowercasing removes case sensitivity.
+    - Abbreviation expansion improves both keyword matching and sparse text features.
+    - Punctuation removal and whitespace normalization produce a stable token space.
+
+    Parameters:
+    series (pd.Series): Raw text series to normalize.
+
+    Returns:
+    pd.Series: Normalized text series.
+    """
     normalized = series.fillna("").astype(str).str.lower()
     normalized = normalized.str.replace(r"[/\-]", " ", regex=True)
 
+    # Expand domain abbreviations before removing punctuation so that
+    # aviation shorthand contributes meaningful tokens.
     for pattern, replacement in abbr_map.items():
         normalized = normalized.str.replace(pattern, replacement, regex=True)
 
@@ -355,6 +431,19 @@ def normalize_series(series: pd.Series) -> pd.Series:
 
 
 def load_input_data(path: str | Path) -> pd.DataFrame:
+    """
+    Load the input workbook and construct normalized text fields.
+
+    Purpose in pipeline:
+    This function prepares the shared text representation used by both
+    rule-based and ML stages.
+
+    Parameters:
+    path (str | Path): Path to the Excel input file.
+
+    Returns:
+    pd.DataFrame: Input data with normalized problem, action, and combined text.
+    """
     print("Loading dataset")
     df = pd.read_excel(path)
     print(f"Total records: {len(df)}")
@@ -368,6 +457,20 @@ def load_input_data(path: str | Path) -> pd.DataFrame:
 
 
 def contains_all_tokens(text_series: pd.Series, tokens: list[str]) -> pd.Series:
+    """
+    Check whether each text row contains all required tokens.
+
+    Purpose in pipeline:
+    This helper supports strict rule matching where multiple tokens must
+    co-occur before a label is assigned.
+
+    Parameters:
+    text_series (pd.Series): Normalized text to inspect.
+    tokens (list[str]): Tokens that must all be present.
+
+    Returns:
+    pd.Series: Boolean mask identifying rows containing all tokens.
+    """
     mask = pd.Series(True, index=text_series.index)
     for token in tokens:
         mask &= text_series.str.contains(
@@ -379,12 +482,32 @@ def contains_all_tokens(text_series: pd.Series, tokens: list[str]) -> pd.Series:
 def apply_seed_rules(
     text_series: pd.Series,
     rule_dict: dict[str, list[str]],
-    and_rule_dict: dict[str, list[list[str]]] | None = None,
+    and_rule_dict: Optional[dict[str, list[list[str]]]] = None,
 ) -> pd.Series:
     """
-    Assign high-confidence initial labels using domain-specific keyword rules.
+    Apply high-precision seed rules to generate initial cluster labels.
 
-    First matching rule wins.
+    Purpose in pipeline:
+    This is the weak-supervision stage. It produces reliable seed labels
+    that are later used to train the ML classifiers.
+
+    Key design decisions:
+    - "First matching rule wins" prevents later rules from overwriting an
+      earlier high-confidence assignment.
+    - Strict AND-token rules are evaluated before simple keyword rules because
+      they are more precise.
+
+    Assumptions:
+    - Input text has already been normalized.
+    - Seed rules prioritize precision over recall.
+
+    Parameters:
+    text_series (pd.Series): Normalized maintenance text.
+    rule_dict (dict[str, list[str]]): Simple keyword-based rules.
+    and_rule_dict (Optional[dict[str, list[list[str]]]]): Strict multi-token rules.
+
+    Returns:
+    pd.Series: Initial cluster labels, with "UNKNOWN" for unmatched rows.
     """
     labels = pd.Series("UNKNOWN", index=text_series.index, dtype=object)
 
@@ -407,9 +530,24 @@ def apply_seed_rules(
 def get_all_matches(
     text_series: pd.Series,
     rule_dict: dict[str, list[str]],
-    and_rule_dict: dict[str, list[list[str]]] | None = None,
+    and_rule_dict: Optional[dict[str, list[list[str]]]] = None,
 ) -> dict[int, list[str]]:
-    matches = {idx: [] for idx in text_series.index}
+    """
+    Collect all rule matches for each record for diagnostic analysis.
+
+    Purpose in pipeline:
+    This function is used to inspect ambiguity in the rule-based stage by
+    determining whether records matched one, multiple, or no rules.
+
+    Parameters:
+    text_series (pd.Series): Normalized maintenance text.
+    rule_dict (dict[str, list[str]]): Simple keyword-based rules.
+    and_rule_dict (Optional[dict[str, list[list[str]]]]): Strict multi-token rules.
+
+    Returns:
+    dict[int, list[str]]: Mapping from row index to all matched labels.
+    """
+    matches: Dict[int, List[str]] = {idx: [] for idx in text_series.index}
 
     if and_rule_dict:
         for label, token_groups in and_rule_dict.items():
@@ -431,16 +569,122 @@ def get_all_matches(
     return matches
 
 
+def apply_temperature_split_override(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Split temperature-related records into separate CHT and EGT clusters.
+
+    Purpose in pipeline:
+    Some records mention only cylinder head temperature, while others mention
+    only exhaust gas temperature. This override makes that split explicit so
+    EGT-only records are not absorbed into c_16.
+
+    Key design decisions:
+    - CHT-only records are assigned to c_16.
+    - EGT-only records are assigned to c_45.
+    - Records mentioning both are left unchanged here and can follow the
+      existing pipeline behavior.
+
+    Parameters:
+    df (pd.DataFrame): Dataset containing text_norm and seed_cluster columns.
+
+    Returns:
+    pd.DataFrame: Dataset with temperature-specific seed overrides applied.
+    """
+    df = df.copy()
+
+    cht_mask = df["text_norm"].str.contains(
+        r"\bcylinder head temperature\b",
+        regex=True,
+        na=False,
+    )
+    egt_mask = df["text_norm"].str.contains(
+        r"\bexhaust gas temperature\b",
+        regex=True,
+        na=False,
+    )
+
+    # Assign only pure CHT mentions to c_16.
+    df.loc[
+        cht_mask & ~egt_mask & (df["seed_cluster"] == "UNKNOWN"),
+        "seed_cluster",
+    ] = "c_16"
+
+    # Assign only pure EGT mentions to c_45.
+    df.loc[
+        egt_mask & ~cht_mask & (df["seed_cluster"] == "UNKNOWN"),
+        "seed_cluster",
+    ] = "c_45"
+
+    return df
+
+
+def apply_prop_split_override(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Split propeller-related records into separate overspeed and damage clusters.
+
+    Purpose in pipeline:
+    Propeller overspeed and propeller damage describe different fault types.
+    This override separates pure damage cases from overspeed cases before the
+    rest of the pipeline continues.
+
+    Key design decisions:
+    - Overspeed-only records are assigned to c_26.
+    - Damage-only records are assigned to c_46.
+    - Records mentioning both are left unchanged here and can follow the
+      existing pipeline behavior.
+
+    Parameters:
+    df (pd.DataFrame): Dataset containing text_norm and seed_cluster columns.
+
+    Returns:
+    pd.DataFrame: Dataset with propeller-specific seed overrides applied.
+    """
+    df = df.copy()
+
+    overspeed_mask = df["text_norm"].str.contains(
+        r"\bpropeller overspeed\b|\boverspeed\b",
+        regex=True,
+        na=False,
+    )
+    damage_mask = df["text_norm"].str.contains(
+        r"\bprop damage\b|\bpropeller damage\b|\bdamaged propeller\b",
+        regex=True,
+        na=False,
+    )
+
+    # Assign only pure overspeed mentions to c_26.
+    df.loc[
+        overspeed_mask & ~damage_mask & (df["seed_cluster"] == "UNKNOWN"),
+        "seed_cluster",
+    ] = "c_26"
+
+    # Assign only pure propeller damage mentions to c_46.
+    df.loc[
+        damage_mask & ~overspeed_mask & (df["seed_cluster"] == "UNKNOWN"),
+        "seed_cluster",
+    ] = "c_46"
+
+    return df
+
+
 def classify_c0_type(text: str) -> str:
     """
-    Grounded inspection logic based on real c_0 trends.
+    Classify inspection-related text into grounded c_0 subtypes.
 
-    Returns one of:
-    - true_inspection
-    - inspection_admin
-    - inspection_panel_misfit
-    - misfit_recluster
-    - review_needed
+    Purpose in pipeline:
+    The inspection cluster is prone to false positives because words such as
+    "inspection" can appear in non-inspection contexts. This function separates
+    true inspection records from likely misfits.
+
+    Key design decisions:
+    - True inspection patterns focus on due/compliance/admin phrasing.
+    - Panel and repair language are treated as likely misfits.
+
+    Parameters:
+    text (str): Normalized combined maintenance text.
+
+    Returns:
+    str: Inspection subtype label.
     """
     text = str(text)
 
@@ -482,13 +726,26 @@ def classify_c0_type(text: str) -> str:
 
 def apply_inspection_override(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Keep only grounded true inspection/admin records in c_0.
-    Release panel/repair/defect inspection mentions back to UNKNOWN.
+    Refine inspection assignments after seed labeling.
+
+    Purpose in pipeline:
+    This override keeps true inspection/admin records in c_0 and sends likely
+    inspection misfits back to UNKNOWN so they can be reconsidered by the
+    hierarchical classification stages.
+
+    Parameters:
+    df (pd.DataFrame): Dataset containing text_norm and seed_cluster columns.
+
+    Returns:
+    pd.DataFrame: Dataset with corrected inspection-related seed labels.
     """
     df = df.copy()
 
     inspection_related = df["text_norm"].str.contains(
-        r"\binspection\b|\binsp\b|\bannual\b|\bbiennial\b|\bnext due\b|\bad\b|\bservice bulletin\b",
+        (
+            r"\binspection\b|\binsp\b|\bannual\b|"
+            r"\bbiennial\b|\bnext due\b|\bad\b|\bservice bulletin\b"
+        ),
         regex=True,
         na=False,
     )
@@ -512,6 +769,19 @@ def apply_inspection_override(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def apply_seed_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply deterministic overrides after seed-rule assignment.
+
+    Purpose in pipeline:
+    This stage enforces domain rules for patterns that should be handled
+    directly rather than relying on ML.
+
+    Parameters:
+    df (pd.DataFrame): Dataset containing text_norm and seed_cluster columns.
+
+    Returns:
+    pd.DataFrame: Dataset with override-adjusted seed labels.
+    """
     df = df.copy()
 
     flight_control_mask = df["text_norm"].str.contains(
@@ -534,6 +804,7 @@ def apply_seed_overrides(df: pd.DataFrame) -> pd.DataFrame:
     ) & df["text_norm"].str.contains(r"\bdirty\b", regex=True, na=False)
     dirty_at_end = df["text_norm"].str.contains(r"\bdirty\s*$", regex=True, na=False)
 
+    # Appearance-related dirty labels should not override explicit engine/filter signals.
     appearance_dirty = dirty_at_end & ~oil_cooler_dirty & ~engine_dirty & ~filter_dirty
     df.loc[appearance_dirty, "seed_cluster"] = "c_43"
 
@@ -541,6 +812,19 @@ def apply_seed_overrides(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def analyze_seed_assignment(all_matches: dict[int, list[str]], df: pd.DataFrame) -> int:
+    """
+    Print diagnostics for the seed-labeling stage.
+
+    Purpose in pipeline:
+    This function summarizes rule coverage and ambiguity before ML is applied.
+
+    Parameters:
+    all_matches (dict[int, list[str]]): All matched seed labels per record.
+    df (pd.DataFrame): Dataset containing seed_cluster assignments.
+
+    Returns:
+    int: Number of UNKNOWN records after the seed stage.
+    """
     single_group = {k: v for k, v in all_matches.items() if len(v) == 1}
     multi_group = {k: v for k, v in all_matches.items() if len(v) > 1}
     no_group = {k: v for k, v in all_matches.items() if len(v) == 0}
@@ -557,6 +841,24 @@ def analyze_seed_assignment(all_matches: dict[int, list[str]], df: pd.DataFrame)
 
 
 def build_features(corpus: pd.Series) -> tuple[TfidfVectorizer, TfidfVectorizer]:
+    """
+    Fit word-level and character-level TF-IDF vectorizers.
+
+    Purpose in pipeline:
+    TF-IDF converts normalized maintenance text into sparse numerical features
+    suitable for Logistic Regression and semantic comparison.
+
+    Key design decisions:
+    - Word n-grams capture phrase-level meaning.
+    - Character n-grams capture spelling variation, abbreviations, and
+      fragmented maintenance shorthand.
+
+    Parameters:
+    corpus (pd.Series): Text corpus used to fit the vectorizers.
+
+    Returns:
+    tuple[TfidfVectorizer, TfidfVectorizer]: Fitted word and character vectorizers.
+    """
     word_vec = TfidfVectorizer(analyzer="word", ngram_range=(1, 2), max_features=40000)
     char_vec = TfidfVectorizer(
         analyzer="char_wb", ngram_range=(3, 5), max_features=20000
@@ -571,11 +873,35 @@ def transform_text(
     text: pd.Series,
     word_vec: TfidfVectorizer,
     char_vec: TfidfVectorizer,
-):
+) -> spmatrix:
+    """
+    Transform text into the combined TF-IDF feature space.
+
+    Parameters:
+    text (pd.Series): Text to transform.
+    word_vec (TfidfVectorizer): Fitted word-level TF-IDF vectorizer.
+    char_vec (TfidfVectorizer): Fitted character-level TF-IDF vectorizer.
+
+    Returns:
+    spmatrix: Combined sparse feature matrix.
+    """
     return hstack([word_vec.transform(text), char_vec.transform(text)])
 
 
 def top2_margin(prob_matrix: np.ndarray) -> np.ndarray:
+    """
+    Compute the gap between the top two predicted probabilities.
+
+    Purpose in pipeline:
+    The margin is used as an additional confidence signal in child-cluster
+    classification. A larger gap indicates a more decisive prediction.
+
+    Parameters:
+    prob_matrix (np.ndarray): Predicted class probabilities.
+
+    Returns:
+    np.ndarray: Top-two probability margin for each row.
+    """
     if prob_matrix.shape[1] < 2:
         return np.ones(prob_matrix.shape[0])
 
@@ -586,11 +912,28 @@ def top2_margin(prob_matrix: np.ndarray) -> np.ndarray:
 
 
 def semantic_predict(
-    x_text,
+    x_text: spmatrix,
     desc_dict: dict[str, str],
     word_vec: TfidfVectorizer,
     char_vec: TfidfVectorizer,
 ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Predict labels by comparing record vectors to description vectors.
+
+    Purpose in pipeline:
+    This is the semantic fallback mechanism used when rule-based or ML
+    confidence is weak. It assigns the label whose description is most
+    similar to the record in TF-IDF space.
+
+    Parameters:
+    x_text (spmatrix): Feature matrix for input records.
+    desc_dict (dict[str, str]): Mapping from label to text description.
+    word_vec (TfidfVectorizer): Fitted word-level vectorizer.
+    char_vec (TfidfVectorizer): Fitted character-level vectorizer.
+
+    Returns:
+    tuple[np.ndarray, np.ndarray]: Predicted labels and similarity scores.
+    """
     desc_series = pd.Series(desc_dict)
     x_desc = transform_text(desc_series, word_vec, char_vec)
 
@@ -602,6 +945,15 @@ def semantic_predict(
 
 
 def get_cluster_name(cluster_label: str) -> str:
+    """
+    Convert a cluster label into a readable cluster name.
+
+    Parameters:
+    cluster_label (str): Internal cluster label.
+
+    Returns:
+    str: Human-readable cluster name.
+    """
     if cluster_label in cluster_name_map:
         return cluster_name_map[cluster_label]
 
@@ -613,6 +965,19 @@ def get_cluster_name(cluster_label: str) -> str:
 
 
 def prepare_known_unknown(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Split the dataset into seed-labeled and unlabeled subsets.
+
+    Purpose in pipeline:
+    Known rows supervise the ML models. Unknown rows are the recovery target
+    for the hierarchical classifier.
+
+    Parameters:
+    df (pd.DataFrame): Dataset containing seed_cluster assignments.
+
+    Returns:
+    tuple[pd.DataFrame, pd.DataFrame]: Known and unknown subsets.
+    """
     known_df = df[df["seed_cluster"] != "UNKNOWN"].copy()
     unknown_df = df[df["seed_cluster"] == "UNKNOWN"].copy()
 
@@ -622,6 +987,19 @@ def prepare_known_unknown(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
 
 
 def fit_global_vectorizers(df: pd.DataFrame) -> tuple[TfidfVectorizer, TfidfVectorizer]:
+    """
+    Fit global TF-IDF vectorizers using records and cluster descriptions.
+
+    Purpose in pipeline:
+    Including cluster descriptions in the fit corpus ensures that both record
+    text and semantic reference text share the same feature space.
+
+    Parameters:
+    df (pd.DataFrame): Full dataset containing text_norm.
+
+    Returns:
+    tuple[TfidfVectorizer, TfidfVectorizer]: Fitted global TF-IDF vectorizers.
+    """
     fit_corpus = pd.concat(
         [
             df["text_norm"],
@@ -639,6 +1017,27 @@ def run_parent_clustering(
     word_vec: TfidfVectorizer,
     char_vec: TfidfVectorizer,
 ) -> np.ndarray:
+    """
+    Predict parent/system labels for UNKNOWN records.
+
+    Purpose in pipeline:
+    This is the first hierarchical ML stage. It predicts broad system-level
+    categories before child-cluster classification.
+
+    Key design decisions:
+    - Logistic Regression is used because it performs well on sparse TF-IDF data.
+    - Semantic similarity acts as a fallback when classifier confidence is weak.
+    - Conservative thresholds reduce noisy parent assignments.
+
+    Parameters:
+    known_df (pd.DataFrame): Seed-labeled records.
+    unknown_df (pd.DataFrame): UNKNOWN records targeted for recovery.
+    word_vec (TfidfVectorizer): Fitted word-level vectorizer.
+    char_vec (TfidfVectorizer): Fitted character-level vectorizer.
+
+    Returns:
+    np.ndarray: Parent predictions for UNKNOWN records.
+    """
     if len(unknown_df) == 0:
         return np.array([], dtype=object)
 
@@ -648,7 +1047,7 @@ def run_parent_clustering(
     x_parent = transform_text(known_df["text_norm"], word_vec, char_vec)
     y_parent = known_df["parent_seed"]
 
-    parent_clf = None
+    parent_clf: Optional[LogisticRegression] = None
     if len(known_df) > 0 and y_parent.nunique() >= 2:
         min_parent_count = int(y_parent.value_counts().min())
 
@@ -662,7 +1061,9 @@ def run_parent_clustering(
             )
 
             parent_clf = LogisticRegression(
-                max_iter=300, class_weight="balanced", C=0.7
+                max_iter=300,
+                class_weight="balanced",
+                C=0.7,
             )
             parent_clf.fit(x_train_p, y_train_p)
 
@@ -675,8 +1076,11 @@ def run_parent_clustering(
             print("\nParent Classification Report:\n")
             print(classification_report(y_val_p, y_val_parent_pred, zero_division=0))
         else:
+            # If a stratified validation split is not reliable, fit on all known data.
             parent_clf = LogisticRegression(
-                max_iter=300, class_weight="balanced", C=0.7
+                max_iter=300,
+                class_weight="balanced",
+                C=0.7,
             )
             parent_clf.fit(x_parent, y_parent)
             print(
@@ -692,9 +1096,16 @@ def run_parent_clustering(
         parent_pred_conf = parent_proba.max(axis=1)
 
         parent_sim_labels, parent_sim_conf = semantic_predict(
-            x_unknown, parent_desc, word_vec, char_vec
+            x_unknown,
+            parent_desc,
+            word_vec,
+            char_vec,
         )
 
+        # Confidence-based fallback mechanism:
+        # 1. accept strong ML prediction
+        # 2. accept weaker ML prediction if semantic prediction agrees
+        # 3. otherwise accept strong semantic match
         for i in range(len(unknown_df)):
             if parent_pred_conf[i] >= 0.5:
                 final_parent[i] = parent_pred_labels[i]
@@ -707,12 +1118,17 @@ def run_parent_clustering(
                 final_parent[i] = parent_sim_labels[i]
     else:
         parent_sim_labels, parent_sim_conf = semantic_predict(
-            x_unknown, parent_desc, word_vec, char_vec
+            x_unknown,
+            parent_desc,
+            word_vec,
+            char_vec,
         )
         for i in range(len(unknown_df)):
             if parent_sim_conf[i] >= 0.12:
                 final_parent[i] = parent_sim_labels[i]
 
+    # Domain constraint: parent "baffle" should only be allowed when the
+    # record explicitly mentions "baffle".
     unknown_has_baffle = (
         unknown_df["text_norm"]
         .str.contains(r"\bbaffle\b", regex=True, na=False)
@@ -733,6 +1149,31 @@ def run_child_clustering(
     word_vec: TfidfVectorizer,
     char_vec: TfidfVectorizer,
 ) -> np.ndarray:
+    """
+    Predict fine-grained child clusters within each parent system.
+
+    Purpose in pipeline:
+    This is the second hierarchical ML stage. It predicts child clusters only
+    within the parent group predicted in the previous stage.
+
+    Key design decisions:
+    - A separate classifier is trained per parent cluster.
+    - If too little child training data exists, the method falls back to
+      `parent_name + "_unspecified"` instead of forcing a noisy child label.
+    - Logistic Regression is used for sparse TF-IDF features.
+    - Semantic similarity and confidence thresholds support fallback behavior.
+
+    Parameters:
+    df (pd.DataFrame): Full dataset.
+    known_df (pd.DataFrame): Seed-labeled records.
+    unknown_df (pd.DataFrame): UNKNOWN records targeted for recovery.
+    final_parent (np.ndarray): Parent predictions for UNKNOWN records.
+    word_vec (TfidfVectorizer): Fitted word-level vectorizer.
+    char_vec (TfidfVectorizer): Fitted character-level vectorizer.
+
+    Returns:
+    np.ndarray: Child-cluster predictions for UNKNOWN records.
+    """
     final_pred = np.array(["UNKNOWN"] * len(unknown_df), dtype=object)
 
     for parent_name, child_clusters in PARENT_TO_CHILDREN.items():
@@ -769,7 +1210,9 @@ def run_child_clustering(
             )
 
             child_val_clf = LogisticRegression(
-                max_iter=300, class_weight="balanced", C=0.5
+                max_iter=300,
+                class_weight="balanced",
+                C=0.5,
             )
             child_val_clf.fit(x_tr, y_tr)
 
@@ -778,11 +1221,17 @@ def run_child_clustering(
             print("Accuracy:", accuracy_score(y_va, y_child_val_pred))
             print(classification_report(y_va, y_child_val_pred, zero_division=0))
 
-        child_clf = LogisticRegression(max_iter=300, class_weight="balanced", C=0.5)
+        child_clf = LogisticRegression(
+            max_iter=300,
+            class_weight="balanced",
+            C=0.5,
+        )
         child_clf.fit(x_train_child, y_train_child)
 
         x_unknown_child = transform_text(
-            unknown_subset["text_norm"], word_vec, char_vec
+            unknown_subset["text_norm"],
+            word_vec,
+            char_vec,
         )
         child_proba = child_clf.predict_proba(x_unknown_child)
         child_pred_labels = child_clf.classes_[child_proba.argmax(axis=1)]
@@ -791,11 +1240,19 @@ def run_child_clustering(
 
         local_desc = {cluster: cluster_desc[cluster] for cluster in child_clusters}
         child_sim_labels, child_sim_conf = semantic_predict(
-            x_unknown_child, local_desc, word_vec, char_vec
+            x_unknown_child,
+            local_desc,
+            word_vec,
+            char_vec,
         )
 
         local_result = np.array(["UNKNOWN"] * len(unknown_subset), dtype=object)
 
+        # Child-level confidence policy:
+        # 1. accept strong ML prediction
+        # 2. accept ML when semantic prediction agrees
+        # 3. accept strong semantic match
+        # 4. otherwise fall back to parent_unspecified
         for j in range(len(unknown_subset)):
             if child_pred_conf[j] >= 0.78 and child_margin[j] >= 0.22:
                 local_result[j] = child_pred_labels[j]
@@ -827,6 +1284,22 @@ def combine_final_clusters(
     final_parent: np.ndarray,
     final_pred: np.ndarray,
 ) -> pd.DataFrame:
+    """
+    Combine seed labels, parent predictions, and child predictions.
+
+    Purpose in pipeline:
+    This function produces the final cluster column by preserving known
+    seed labels and filling UNKNOWN rows with the hierarchical outputs.
+
+    Parameters:
+    df (pd.DataFrame): Full dataset.
+    unknown_df (pd.DataFrame): Rows that were UNKNOWN after the seed stage.
+    final_parent (np.ndarray): Parent predictions for UNKNOWN rows.
+    final_pred (np.ndarray): Child predictions for UNKNOWN rows.
+
+    Returns:
+    pd.DataFrame: Dataset with the final cluster column populated.
+    """
     df = df.copy()
     df["cluster"] = df["seed_cluster"]
 
@@ -842,7 +1315,22 @@ def combine_final_clusters(
 
 def apply_final_overrides(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply final domain-specific override rules after ML-based clustering.
+    Apply final domain-specific overrides after hierarchical classification.
+
+    Purpose in pipeline:
+    Some cases are better handled with explicit business rules than by ML alone,
+    especially dirty/oil/filter/tire-related records.
+
+    Key design decisions:
+    - Specific filter cases are handled before generic filter fallbacks.
+    - Tire logic only affects records that remain UNKNOWN.
+    - If text_norm is absent, it is reconstructed from PROBLEM and ACTION.
+
+    Parameters:
+    df (pd.DataFrame): Dataset containing cluster information and maintenance text.
+
+    Returns:
+    pd.DataFrame: Dataset with final override corrections applied.
     """
     df = df.copy()
 
@@ -859,29 +1347,42 @@ def apply_final_overrides(df: pd.DataFrame) -> pd.DataFrame:
 
     text = df["text_norm"]
 
-    engine_dirty = text.str.contains(r"\bengine\b", regex=True, na=False) & text.str.contains(
-        r"\bdirty\b", regex=True, na=False
-    )
+    engine_dirty = text.str.contains(
+        r"\bengine\b",
+        regex=True,
+        na=False,
+    ) & text.str.contains(r"\bdirty\b", regex=True, na=False)
     oil_cooler_dirty = text.str.contains(
-        r"\boil cooler\b", regex=True, na=False
+        r"\boil cooler\b",
+        regex=True,
+        na=False,
     ) & text.str.contains(r"\bdirty\b", regex=True, na=False)
 
     oil_filter_dirty = text.str.contains(
-        r"\boil filter\b", regex=True, na=False
+        r"\boil filter\b",
+        regex=True,
+        na=False,
     ) & text.str.contains(r"\bdirty\b", regex=True, na=False)
 
     fuel_filter_dirty = text.str.contains(
-        r"\bfuel filter\b", regex=True, na=False
+        r"\bfuel filter\b",
+        regex=True,
+        na=False,
     ) & text.str.contains(r"\bdirty\b", regex=True, na=False)
 
     air_filter_dirty = text.str.contains(
-        r"\bair filter\b", regex=True, na=False
+        r"\bair filter\b",
+        regex=True,
+        na=False,
     ) & text.str.contains(r"\bdirty\b", regex=True, na=False)
 
     generic_filter_dirty = text.str.contains(
-        r"\bfilter\b", regex=True, na=False
+        r"\bfilter\b",
+        regex=True,
+        na=False,
     ) & text.str.contains(r"\bdirty\b", regex=True, na=False)
 
+    # Specific subsystem cases are assigned before generic fallback logic.
     df.loc[oil_cooler_dirty, "cluster"] = "c_32"
     df.loc[oil_filter_dirty, "cluster"] = "oil_system_unspecified"
     df.loc[fuel_filter_dirty, "cluster"] = "fuel_control_unspecified"
@@ -901,13 +1402,10 @@ def apply_final_overrides(df: pd.DataFrame) -> pd.DataFrame:
         "cluster",
     ] = "engine_general_unspecified"
 
-    tire_problem_unknown = (
-        df["PROBLEM"]
-        .fillna("")
-        .astype(str)
-        .str.lower()
-        .str.contains(r"\btire\b", regex=True, na=False)
-        & (df["cluster"] == "UNKNOWN")
+    tire_problem_unknown = df["PROBLEM"].fillna("").astype(
+        str
+    ).str.lower().str.contains(r"\btire\b", regex=True, na=False) & (
+        df["cluster"] == "UNKNOWN"
     )
     df.loc[tire_problem_unknown, "cluster"] = "c_44"
 
@@ -915,6 +1413,20 @@ def apply_final_overrides(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def save_outputs(df: pd.DataFrame, before_unknown: int) -> None:
+    """
+    Save the final clustered dataset and print recovery diagnostics.
+
+    Purpose in pipeline:
+    This is the terminal output stage. It writes the final labeled dataset
+    and reports how many UNKNOWN records were recovered.
+
+    Parameters:
+    df (pd.DataFrame): Final dataset containing cluster assignments.
+    before_unknown (int): Number of UNKNOWN records after seed labeling.
+
+    Returns:
+    None: The function writes the final dataset to disk.
+    """
     after_unknown = int((df["cluster"] == "UNKNOWN").sum())
     recovered = before_unknown - after_unknown
 
@@ -942,22 +1454,78 @@ def save_outputs(df: pd.DataFrame, before_unknown: int) -> None:
 
 
 def apply_flight_control_override(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply flight-control-related seed overrides.
+
+    Parameters:
+    df (pd.DataFrame): Dataset used for override testing.
+
+    Returns:
+    pd.DataFrame: Dataset after seed overrides are applied.
+    """
     return apply_seed_overrides(df)
 
 
 def apply_dirty_seed_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply dirty-related seed overrides.
+
+    Parameters:
+    df (pd.DataFrame): Dataset used for override testing.
+
+    Returns:
+    pd.DataFrame: Dataset after seed overrides are applied.
+    """
     return apply_seed_overrides(df)
 
 
 def apply_final_dirty_overrides(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply final dirty/filter overrides.
+
+    Parameters:
+    df (pd.DataFrame): Dataset used for override testing.
+
+    Returns:
+    pd.DataFrame: Dataset after final overrides are applied.
+    """
     return apply_final_overrides(df)
 
 
 def apply_final_tire_override(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply final tire-related overrides.
+
+    Parameters:
+    df (pd.DataFrame): Dataset used for override testing.
+
+    Returns:
+    pd.DataFrame: Dataset after final overrides are applied.
+    """
     return apply_final_overrides(df)
 
 
 def main() -> None:
+    """
+    Execute the full maintenance clustering pipeline.
+
+    Purpose in pipeline:
+    This function orchestrates the complete workflow:
+    1. load and normalize data
+    2. assign seed labels using rules
+    3. apply temperature split, prop split, inspection, and deterministic overrides
+    4. fit TF-IDF features
+    5. run parent-level ML classification
+    6. run child-level ML classification
+    7. apply final override logic
+    8. save the final dataset
+
+    Parameters:
+    None: This function does not accept external parameters.
+
+    Returns:
+    None: The function writes pipeline outputs to disk.
+    """
     DATASET_DIR.mkdir(parents=True, exist_ok=True)
 
     df = load_input_data(INPUT_FILE)
@@ -965,8 +1533,22 @@ def main() -> None:
     print("INITIAL SEED CLUSTERING")
 
     all_matches = get_all_matches(df["text_norm"], seed_rules, baffle_and_rules)
-    df["seed_cluster"] = apply_seed_rules(df["text_norm"], seed_rules, baffle_and_rules)
+    df["seed_cluster"] = apply_seed_rules(
+        df["text_norm"],
+        seed_rules,
+        baffle_and_rules,
+    )
 
+    # Temperature split is applied before other overrides so that
+    # pure EGT-only and CHT-only records are separated early.
+    df = apply_temperature_split_override(df)
+
+    # Propeller split is applied before other overrides so that
+    # pure overspeed-only and damage-only records are separated early.
+    df = apply_prop_split_override(df)
+
+    # Inspection cleanup is applied before general seed overrides so that
+    # c_0 remains more precise.
     df = apply_inspection_override(df)
     df = apply_seed_overrides(df)
 
@@ -979,13 +1561,16 @@ def main() -> None:
     print("Features completed")
 
     print("PHASE 1: PARENT CLUSTERING")
-
     final_parent = run_parent_clustering(known_df, unknown_df, word_vec, char_vec)
 
     print("PHASE 2: CHILD CLUSTERING")
-
     final_pred = run_child_clustering(
-        df, known_df, unknown_df, final_parent, word_vec, char_vec
+        df,
+        known_df,
+        unknown_df,
+        final_parent,
+        word_vec,
+        char_vec,
     )
 
     print("FINAL CLUSTER ASSIGNMENT")
