@@ -119,7 +119,7 @@ abbr_map: Dict[str, str] = {
     r"\bfod\b": "foreign object debris",
     r"\brivnut\b": "rivet nut",
     r"\bnutplate\b": "nut plate",
-    r"\b\vfeb": "maximum flap extended speed",
+    r"\bvfeb": "maximum flap extended speed",
     r"\bgpu\b": "ground power unit",
 }
 
@@ -169,7 +169,7 @@ cluster_desc: Dict[str, str] = {
     "c_39": "spark plug plug fouled",
     "c_40": "battery issue low voltage weak battery charging issue",
     "c_41": "external start issue external power ground power unit start",
-    "c_42": "flight control aileron elevator rudder flap spoiler trim",
+    "c_42": "aileron",
     "c_43": (
         "appearance cleaning paint wash dirty exterior clean fuselage "
         "surface finish cosmetic exterior surface"
@@ -177,6 +177,11 @@ cluster_desc: Dict[str, str] = {
     "c_44": "landing gear tire",
     "c_45": "exhaust gas temperature",
     "c_46": "propeller damage",
+    "c_47": "elevator",
+    "c_48": "rudder",
+    "c_49": "flap",
+    "c_50": "spoiler"
+ #   "c_51": "trim"
 }
 
 cluster_name_map: Dict[str, str] = cluster_desc.copy()
@@ -213,6 +218,7 @@ parent_desc: Dict[str, str] = {
         "cosmetic exterior appearance cleaning"
     ),
     "landing_gear_tire": "landing gear tire",
+    "flight_control": "flight control aileron elevator rudder flap spoiler "
 }
 
 cluster_to_parent: Dict[str, str] = {
@@ -258,11 +264,16 @@ cluster_to_parent: Dict[str, str] = {
     "c_37": "valve_cover",
     "c_38": "valve_cover",
     "c_40": "electrical",
-    "c_42": "flight_control",
     "c_43": "appearance_cleaning",
     "c_44": "landing_gear_tire",
     "c_45": "cylinder_Exhaust",
     "c_46": "propeller",
+    "c_42": "flight_control",   # aileron
+    "c_47": "flight_control",   # elevator
+    "c_48": "flight_control",   # rudder
+    "c_49": "flight_control",   # flap
+    "c_50": "flight_control"   # spoiler
+#    "c_51": "flight_control"   # trim
 }
 
 
@@ -370,10 +381,16 @@ seed_rules: Dict[str, List[str]] = {
         "no defects noted",
         "no defects found",
     ],
-    "c_42": ["aileron", "elevator", "rudder", "flap", "spoiler", "trim", "strut"],
+#    "c_42": ["aileron", "elevator", "rudder", "flap", "spoiler", "trim", "strut"],
     "c_43": ["paint", "wash", "dirty exterior", "cosmetic"],
     "c_45": ["exhaust gas temperature", "egt"],
     "c_46": ["prop damage", "propeller damage", "damaged propeller"],
+    "c_42": ["aileron"],
+    "c_47": ["elevator"],
+    "c_48": ["rudder"],
+    "c_49": ["flap"],
+    "c_50": ["spoiler"]
+#    "c_51": ["trim"],
 }
 
 # Baffle records often contain overlapping terms. These stricter token rules
@@ -784,12 +801,19 @@ def apply_seed_overrides(df: pd.DataFrame) -> pd.DataFrame:
     """
     df = df.copy()
 
-    flight_control_mask = df["text_norm"].str.contains(
-        r"\b(?:aileron|elevator|rudder|flap|spoiler|trim)\b",
-        regex=True,
-        na=False,
-    )
-    df.loc[flight_control_mask, "seed_cluster"] = "c_42"
+    aileron_mask = df["text_norm"].str.contains(r"\baileron\b", regex=True, na=False)
+    elevator_mask = df["text_norm"].str.contains(r"\belevator\b", regex=True, na=False)
+    rudder_mask = df["text_norm"].str.contains(r"\brudder\b", regex=True, na=False)
+    flap_mask = df["text_norm"].str.contains(r"\bflap\b", regex=True, na=False)
+    spoiler_mask = df["text_norm"].str.contains(r"\bspoiler\b", regex=True, na=False)
+#    trim_mask = df["text_norm"].str.contains(r"\btrim\b", regex=True, na=False)
+
+    df.loc[aileron_mask, "seed_cluster"] = "c_42"
+    df.loc[elevator_mask, "seed_cluster"] = "c_47"
+    df.loc[rudder_mask, "seed_cluster"] = "c_48"
+    df.loc[flap_mask, "seed_cluster"] = "c_49"
+    df.loc[spoiler_mask, "seed_cluster"] = "c_50"
+ #   df.loc[trim_mask, "seed_cluster"] = "c_51"
 
     oil_cooler_dirty = df["text_norm"].str.contains(
         r"\boil cooler\b", regex=True, na=False
@@ -1408,6 +1432,9 @@ def apply_final_overrides(df: pd.DataFrame) -> pd.DataFrame:
         df["cluster"] == "UNKNOWN"
     )
     df.loc[tire_problem_unknown, "cluster"] = "c_44"
+
+    flight_control_door_unknown= ((df["cluster"]=="flight_control_unspecified") & text.str.contains(r"\bdoor\b",regex=True,na=False))
+    df.loc[flight_control_door_unknown,"cluster"]="UNKNOWN"
 
     return df
 

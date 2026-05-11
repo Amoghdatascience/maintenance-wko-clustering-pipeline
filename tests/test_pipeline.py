@@ -284,14 +284,14 @@ def test_flight_control_override_for_rudder() -> None:
     """
     df = pd.DataFrame(
         {
-            "text_norm": ["rudder trim issue"],
+            "text_norm": ["rudder issue"],
             "seed_cluster": ["UNKNOWN"],
         }
     )
 
     result = apply_flight_control_override(df)
 
-    assert result.loc[0, "seed_cluster"] == "c_42"
+    assert result.loc[0, "seed_cluster"] == "c_48"
 
 
 def test_oil_cooler_dirty_seed_goes_to_c32() -> None:
